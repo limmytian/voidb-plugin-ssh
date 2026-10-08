@@ -13,7 +13,7 @@ transport = "stdio-jsonrpc"
 
 [connections]
 profile_schema = "schemas/profile.schema.json"
-secret_classes = ["ssh_password", "ssh_key_passphrase"]
+secret_classes = ["password", "private_key"]
 
 [[capabilities]]
 id = "test"
@@ -21,7 +21,7 @@ description = "Connect and authenticate to an SSH target without opening an inte
 input_schema = "schemas/test-input.schema.json"
 output_schema = "schemas/test-output.schema.json"
 permissions = ["connection.test", "ssh.test"]
-risk = "readonly"
+risk = "read_only"
 destructive = false
 streaming = false
 connection_required = true
@@ -47,7 +47,7 @@ description = "Read a bounded incremental output window from an agent-owned inte
 input_schema = "schemas/terminal_read-input.schema.json"
 output_schema = "schemas/terminal_read-output.schema.json"
 permissions = ["connection.read", "ssh.terminal.read"]
-risk = "readonly"
+risk = "read_only"
 destructive = false
 streaming = true
 connection_required = true
@@ -60,7 +60,7 @@ description = "Return a bounded plain-text screen snapshot and terminal mode met
 input_schema = "schemas/terminal_snapshot-input.schema.json"
 output_schema = "schemas/terminal_snapshot-output.schema.json"
 permissions = ["connection.read", "ssh.terminal.read"]
-risk = "readonly"
+risk = "read_only"
 destructive = false
 streaming = false
 connection_required = true
@@ -125,7 +125,7 @@ description = "Inspect a local forward inside a persistent SSH agent session."
 input_schema = "schemas/forward_status-input.schema.json"
 output_schema = "schemas/forward_status-output.schema.json"
 permissions = ["connection.read", "ssh.forward"]
-risk = "readonly"
+risk = "read_only"
 destructive = false
 streaming = false
 connection_required = true
@@ -138,7 +138,7 @@ description = "List a remote SFTP directory with bounded, cursor-based output."
 input_schema = "schemas/sftp_list-input.schema.json"
 output_schema = "schemas/sftp_list-output.schema.json"
 permissions = ["connection.read", "sftp.list"]
-risk = "readonly"
+risk = "read_only"
 destructive = false
 streaming = false
 connection_required = true
@@ -203,13 +203,16 @@ description = "Return agent-safe SSH profile diagnostics without opening a netwo
 input_schema = "schemas/diagnostics-input.schema.json"
 output_schema = "schemas/diagnostics-output.schema.json"
 permissions = ["connection.read", "ssh.diagnostics"]
-risk = "readonly"
+risk = "read_only"
 destructive = false
 streaming = false
 connection_required = true
 supports_dry_run = false
 default_timeout_ms = 30000
 
-[tui]
-command = ["tui"]
+[ui]
+tui = true
 
+[requirements]
+voidb_core = ">=0.1.0"
+platforms = ["darwin", "linux", "windows"]
