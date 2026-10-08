@@ -200,19 +200,7 @@ pub(crate) fn strict_host_key_check(
             );
             Ok(false)
         }
-        Err(_) => {
-            record_host_key_failure(
-                host_key_failure,
-                DirectHostKeyFailure {
-                    kind: DirectHostKeyFailureKind::Unknown,
-                    host: host.to_string(),
-                    port,
-                    fingerprint: format_fingerprint(server_public_key),
-                    known_hosts_line: None,
-                },
-            );
-            Ok(false)
-        }
+        Err(e) => Err(russh::Error::from(e)),
     }
 }
 

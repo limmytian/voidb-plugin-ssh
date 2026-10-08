@@ -26,13 +26,16 @@ pub struct SshConfig {
 #[serde(tag = "type")]
 pub enum SshAuthMethod {
     /// Password authentication
+    #[serde(alias = "password")]
     Password { password: String },
     /// Public key authentication
+    #[serde(alias = "public_key", alias = "publicKey", alias = "public-key")]
     PublicKey {
         private_key_path: String,
         passphrase: Option<String>,
     },
     /// SSH agent authentication (uses SSH_AUTH_SOCK)
+    #[serde(alias = "agent")]
     Agent,
 }
 

@@ -1193,6 +1193,10 @@ impl SshTuiApp {
         }
 
         match self.mode {
+            Mode::HostKeyPrompt => {
+                self.handle_host_key_key(key);
+                return;
+            }
             Mode::Sftp => {
                 self.handle_sftp_key(key);
                 return;
@@ -2272,7 +2276,7 @@ impl SshTuiApp {
         };
 
         match key.code {
-            KeyCode::Char('a') => {
+            KeyCode::Char('a') | KeyCode::Char('y') | KeyCode::Enter => {
                 if let Some(reply) = prompt.reply.take() {
                     let _ = reply.send(true);
                 }
@@ -2281,7 +2285,7 @@ impl SshTuiApp {
                 self.push_line("[local] host key accepted");
                 self.host_key_prompt = None;
             }
-            KeyCode::Char('r') | KeyCode::Esc => {
+            KeyCode::Char('r') | KeyCode::Char('n') | KeyCode::Esc => {
                 if let Some(reply) = prompt.reply.take() {
                     let _ = reply.send(false);
                 }
@@ -2291,7 +2295,7 @@ impl SshTuiApp {
                 self.host_key_prompt = None;
             }
             _ => {
-                self.status = "host key prompt requires a=accept or r=reject".to_string();
+                self.status = "host key prompt: press y/a to accept, n/r/Esc to reject".to_string();
             }
         }
     }

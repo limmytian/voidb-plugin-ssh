@@ -1,6 +1,6 @@
 id = "ssh"
 name = "SSH and SFTP Remote Management Plugin"
-version = "0.3.1"
+version = "0.3.3"
 protocol_version = "1"
 description = "SSH terminal, port forwarding, and SFTP management process plugin for VoidB."
 license = "Apache-2.0"
@@ -24,9 +24,12 @@ permissions = ["connection.test", "ssh.test"]
 risk = "read_only"
 destructive = false
 streaming = false
+execution_mode = "stateless"
 connection_required = true
 supports_dry_run = false
 default_timeout_ms = 30000
+[capabilities.authorization]
+declared = true
 
 [[capabilities]]
 id = "exec"
@@ -37,9 +40,22 @@ permissions = ["connection.read", "ssh.exec"]
 risk = "destructive"
 destructive = true
 streaming = false
+execution_mode = "both"
 connection_required = true
 supports_dry_run = true
 default_timeout_ms = 30000
+[capabilities.session_handoff]
+purpose = { kind = "interactive_terminal" }
+capabilities = ["ssh.exec"]
+[capabilities.authorization]
+declared = true
+interactive_execute = true
+session_purposes = [{ kind = "interactive_terminal" }]
+[capabilities.authorization.approval_schema]
+version = 1
+fields = [
+    { path = "/command", label = "Remote command", value_type = "string", required = true, description = "Exact shell command string; argv-style execution is not currently exposed.", risk_emphasis = "destructive" }
+]
 
 [[capabilities]]
 id = "terminal_read"
@@ -50,9 +66,16 @@ permissions = ["connection.read", "ssh.terminal.read"]
 risk = "read_only"
 destructive = false
 streaming = true
+execution_mode = "session_only"
 connection_required = true
 supports_dry_run = false
 default_timeout_ms = 30000
+[capabilities.session_handoff]
+purpose = { kind = "interactive_terminal" }
+capabilities = ["ssh.terminal_read", "ssh.terminal_snapshot", "ssh.terminal_write", "ssh.terminal_resize", "ssh.terminal_signal"]
+[capabilities.authorization]
+declared = true
+session_purposes = [{ kind = "interactive_terminal" }]
 
 [[capabilities]]
 id = "terminal_snapshot"
@@ -63,9 +86,16 @@ permissions = ["connection.read", "ssh.terminal.read"]
 risk = "read_only"
 destructive = false
 streaming = false
+execution_mode = "session_only"
 connection_required = true
 supports_dry_run = false
 default_timeout_ms = 30000
+[capabilities.session_handoff]
+purpose = { kind = "interactive_terminal" }
+capabilities = ["ssh.terminal_read", "ssh.terminal_snapshot", "ssh.terminal_write", "ssh.terminal_resize", "ssh.terminal_signal"]
+[capabilities.authorization]
+declared = true
+session_purposes = [{ kind = "interactive_terminal" }]
 
 [[capabilities]]
 id = "terminal_write"
@@ -76,9 +106,17 @@ permissions = ["connection.write", "ssh.terminal.control"]
 risk = "destructive"
 destructive = true
 streaming = false
+execution_mode = "session_only"
 connection_required = true
 supports_dry_run = false
 default_timeout_ms = 30000
+[capabilities.session_handoff]
+purpose = { kind = "interactive_terminal" }
+capabilities = ["ssh.terminal_read", "ssh.terminal_snapshot", "ssh.terminal_write", "ssh.terminal_resize", "ssh.terminal_signal"]
+[capabilities.authorization]
+declared = true
+session_purposes = [{ kind = "interactive_terminal" }]
+note = "Interactive PTY control is intentionally Custom-only and requires a short-lived destructive grant."
 
 [[capabilities]]
 id = "terminal_resize"
@@ -89,9 +127,16 @@ permissions = ["connection.write", "ssh.terminal.control"]
 risk = "destructive"
 destructive = true
 streaming = false
+execution_mode = "session_only"
 connection_required = true
 supports_dry_run = false
 default_timeout_ms = 30000
+[capabilities.session_handoff]
+purpose = { kind = "interactive_terminal" }
+capabilities = ["ssh.terminal_read", "ssh.terminal_snapshot", "ssh.terminal_write", "ssh.terminal_resize", "ssh.terminal_signal"]
+[capabilities.authorization]
+declared = true
+session_purposes = [{ kind = "interactive_terminal" }]
 
 [[capabilities]]
 id = "terminal_signal"
@@ -102,9 +147,16 @@ permissions = ["connection.write", "ssh.terminal.control"]
 risk = "destructive"
 destructive = true
 streaming = false
+execution_mode = "session_only"
 connection_required = true
 supports_dry_run = false
 default_timeout_ms = 30000
+[capabilities.session_handoff]
+purpose = { kind = "interactive_terminal" }
+capabilities = ["ssh.terminal_read", "ssh.terminal_snapshot", "ssh.terminal_write", "ssh.terminal_resize", "ssh.terminal_signal"]
+[capabilities.authorization]
+declared = true
+session_purposes = [{ kind = "interactive_terminal" }]
 
 [[capabilities]]
 id = "forward_open"
@@ -115,9 +167,16 @@ permissions = ["connection.forward", "ssh.forward"]
 risk = "destructive"
 destructive = true
 streaming = false
+execution_mode = "session_only"
 connection_required = true
 supports_dry_run = true
 default_timeout_ms = 30000
+[capabilities.session_handoff]
+purpose = { kind = "port_forward" }
+capabilities = ["ssh.forward_open", "ssh.forward_status"]
+[capabilities.authorization]
+declared = true
+session_purposes = [{ kind = "port_forward" }]
 
 [[capabilities]]
 id = "forward_status"
@@ -128,9 +187,16 @@ permissions = ["connection.read", "ssh.forward"]
 risk = "read_only"
 destructive = false
 streaming = false
+execution_mode = "session_only"
 connection_required = true
 supports_dry_run = false
 default_timeout_ms = 30000
+[capabilities.session_handoff]
+purpose = { kind = "port_forward" }
+capabilities = ["ssh.forward_open", "ssh.forward_status"]
+[capabilities.authorization]
+declared = true
+session_purposes = [{ kind = "port_forward" }]
 
 [[capabilities]]
 id = "sftp_list"
@@ -141,9 +207,16 @@ permissions = ["connection.read", "sftp.list"]
 risk = "read_only"
 destructive = false
 streaming = false
+execution_mode = "both"
 connection_required = true
 supports_dry_run = false
 default_timeout_ms = 30000
+[capabilities.session_handoff]
+purpose = { kind = "file_transfer" }
+capabilities = ["ssh.sftp_list"]
+[capabilities.authorization]
+declared = true
+session_purposes = [{ kind = "file_transfer" }]
 
 [[capabilities]]
 id = "sftp_get"
@@ -154,9 +227,16 @@ permissions = ["connection.read", "sftp.read", "local.write"]
 risk = "mutating"
 destructive = false
 streaming = false
+execution_mode = "both"
 connection_required = true
 supports_dry_run = false
 default_timeout_ms = 30000
+[capabilities.session_handoff]
+purpose = { kind = "file_transfer" }
+capabilities = ["ssh.sftp_get"]
+[capabilities.authorization]
+declared = true
+session_purposes = [{ kind = "file_transfer" }]
 
 [[capabilities]]
 id = "sftp_put"
@@ -167,9 +247,16 @@ permissions = ["connection.write", "sftp.write", "local.read"]
 risk = "destructive"
 destructive = true
 streaming = false
+execution_mode = "both"
 connection_required = true
 supports_dry_run = true
 default_timeout_ms = 30000
+[capabilities.session_handoff]
+purpose = { kind = "file_transfer" }
+capabilities = ["ssh.sftp_put"]
+[capabilities.authorization]
+declared = true
+session_purposes = [{ kind = "file_transfer" }]
 
 [[capabilities]]
 id = "sftp_mkdir"
@@ -180,9 +267,16 @@ permissions = ["connection.write", "sftp.write"]
 risk = "destructive"
 destructive = true
 streaming = false
+execution_mode = "both"
 connection_required = true
 supports_dry_run = true
 default_timeout_ms = 30000
+[capabilities.session_handoff]
+purpose = { kind = "file_transfer" }
+capabilities = ["ssh.sftp_mkdir"]
+[capabilities.authorization]
+declared = true
+session_purposes = [{ kind = "file_transfer" }]
 
 [[capabilities]]
 id = "sftp_rm"
@@ -193,9 +287,16 @@ permissions = ["connection.write", "sftp.delete"]
 risk = "destructive"
 destructive = true
 streaming = false
+execution_mode = "both"
 connection_required = true
 supports_dry_run = true
 default_timeout_ms = 30000
+[capabilities.session_handoff]
+purpose = { kind = "file_transfer" }
+capabilities = ["ssh.sftp_rm"]
+[capabilities.authorization]
+declared = true
+session_purposes = [{ kind = "file_transfer" }]
 
 [[capabilities]]
 id = "diagnostics"
@@ -206,9 +307,12 @@ permissions = ["connection.read", "ssh.diagnostics"]
 risk = "read_only"
 destructive = false
 streaming = false
+execution_mode = "stateless"
 connection_required = true
 supports_dry_run = false
 default_timeout_ms = 30000
+[capabilities.authorization]
+declared = true
 
 [ui]
 tui = true

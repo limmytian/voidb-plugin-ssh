@@ -23,7 +23,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::Utc;
-use clap::{Arg, ArgMatches, Command};
+use clap::{Arg, ArgAction, ArgMatches, Command};
 use russh::ChannelMsg;
 use serde::Serialize;
 use serde_json::json;
@@ -255,7 +255,13 @@ impl CliPlugin for SshCliPlugin {
         vec![
             Command::new("test")
                 .about("Test SSH connection")
-                .arg(conn_arg.clone()),
+                .arg(conn_arg.clone().required(false))
+                .arg(
+                    Arg::new("stdin-config")
+                        .long("stdin-config")
+                        .action(ArgAction::SetTrue)
+                        .help("Read connection configuration JSON from stdin"),
+                ),
             Command::new("exec")
                 .about("Execute a remote command")
                 .arg(conn_arg.clone())
@@ -407,9 +413,18 @@ impl CliPlugin for SshCliPlugin {
 impl SshCliPlugin {
     /// Parse and validate the SSH config for a named connection from the CLI context.
     fn parse_config(conn_name: &str, ctx: &CliContext) -> Result<SshConfig, VoidbError> {
-        let config = ctx
-            .find_connection(conn_name)
-            .ok_or_else(|| VoidbError::Plugin(format!("Connection '{}' not found", conn_name)))?;
+        let config = if let Some(config) = ctx.find_connection(conn_name) {
+            config.clone()
+        } else if let Ok((_profile, config)) =
+            ctx.resolve_profile_connection(conn_name, Some("ssh"))
+        {
+            config
+        } else {
+            return Err(VoidbError::Plugin(format!(
+                "Connection or profile '{}' not found",
+                conn_name
+            )));
+        };
 
         if config.effective_plugin_id() != "ssh" {
             return Err(VoidbError::Plugin(format!(
@@ -643,8 +658,31 @@ impl SshCliPlugin {
     // -----------------------------------------------------------------------
 
     async fn handle_test(&self, matches: &ArgMatches, ctx: &CliContext) -> Result<(), VoidbError> {
-        let conn_name = matches.get_one::<String>("connection").unwrap();
-        let ssh_config = Self::parse_config(conn_name, ctx)?;
+        let (conn_name, ssh_config) = if matches.get_flag("stdin-config") {
+            use std::io::Read;
+            let mut input = String::new();
+            std::io::stdin()
+                .read_to_string(&mut input)
+                .map_err(|e| VoidbError::Config(format!("Failed to read stdin: {}", e)))?;
+            let val: serde_json::Value = serde_json::from_str(&input)
+                .map_err(|e| VoidbError::Config(format!("Invalid JSON on stdin: {}", e)))?;
+            let name = val
+                .get("name")
+                .and_then(|n| n.as_str())
+                .unwrap_or("stdin")
+                .to_string();
+            let plugin_val = val.get("plugin_config").unwrap_or(&val);
+            let cfg: SshConfig = serde_json::from_value(plugin_val.clone())
+                .map_err(|e| VoidbError::Config(format!("Invalid SSH config: {}", e)))?;
+            (name, cfg)
+        } else if let Some(conn_name) = matches.get_one::<String>("connection") {
+            let cfg = Self::parse_config(conn_name, ctx)?;
+            (conn_name.clone(), cfg)
+        } else {
+            return Err(VoidbError::Plugin(
+                "Either --connection or --stdin-config is required".into(),
+            ));
+        };
 
         print!("Testing connection '{}'... ", conn_name);
         // new_direct() connects and authenticates; success means the connection works.
