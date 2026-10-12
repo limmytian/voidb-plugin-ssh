@@ -1,6 +1,6 @@
 id = "ssh"
 name = "SSH and SFTP Remote Management Plugin"
-version = "0.3.3"
+version = "0.3.4"
 protocol_version = "1"
 description = "SSH terminal, port forwarding, and SFTP management process plugin for VoidB."
 license = "Apache-2.0"
