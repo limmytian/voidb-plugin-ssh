@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -43,6 +44,7 @@ const DEFAULT_TERMINAL_COLS: u16 = 80;
 const DEFAULT_TERMINAL_ROWS: u16 = 24;
 const ASSIST_STATUS_LIMIT_BYTES: usize = 512;
 const ASSIST_CONTROL_COMMAND_LIMIT_BYTES: usize = 4096;
+const PAGE_STEP: isize = 10;
 
 static NEXT_SSH_TUI_OWNER_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -171,10 +173,59 @@ enum Mode {
     Monitor,
     HostKeyPrompt,
     AgentOperationReview,
-    Help,
     Disconnected,
     Error,
 }
+
+/// Full-screen or popup surfaces stacked on top of the active mode. Input is
+/// routed to the active overlay first, so each surface owns its key space.
+/// Raw terminal interaction never flows through this dispatch: overlays are
+/// only reachable through the local escape layer or from browsing surfaces,
+/// so PTY keystrokes are untouched while no overlay is open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Overlay {
+    None,
+    Help,
+    TranscriptViewer,
+    SftpPicker,
+    ConfirmQuit,
+}
+
+/// Top-level surfaces shown in the header tabs. Tab/BackTab cycle the
+/// browsing surfaces (SFTP, forwarding, monitor); the terminal surface is
+/// reached with the escape layer or `t`, never by cycling, because Tab is
+/// raw PTY input there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Surface {
+    Terminal,
+    Sftp,
+    Forwarding,
+    Monitor,
+}
+
+impl Surface {
+    const ALL: [Surface; 4] = [Self::Terminal, Self::Sftp, Self::Forwarding, Self::Monitor];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Terminal => "terminal",
+            Self::Sftp => "sftp",
+            Self::Forwarding => "forwarding",
+            Self::Monitor => "monitor",
+        }
+    }
+
+    fn hotkey(self) -> char {
+        match self {
+            Self::Terminal => 'T',
+            Self::Sftp => 'S',
+            Self::Forwarding => 'F',
+            Self::Monitor => 'M',
+        }
+    }
+}
+
+const BROWSING_SURFACES: [Surface; 3] = [Surface::Sftp, Surface::Forwarding, Surface::Monitor];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PtyInputOwnerState {
@@ -487,8 +538,9 @@ pub fn build_ssh_tui_evidence(launch: &SshTuiLaunch) -> Result<Value> {
             "error_state_forwards_raw_input": false,
             "keys": [
                 {"key": "r", "action": "request reconnect"},
-                {"key": "q", "action": "quit"},
-                {"key": "?", "action": "show help"},
+                {"key": "q", "action": "quit; asks for confirmation while a session, transfer, forward, or agent share is active"},
+                {"key": "?", "action": "show help overlay"},
+                {"key": "Ctrl+] then l", "action": "open the scrollable terminal transcript viewer"},
                 {"key": "Ctrl+] then v", "action": "revoke external agent current PTY control"}
             ],
             "terminal_restore_on_exit": launch.restore
@@ -552,7 +604,16 @@ pub fn build_ssh_tui_evidence(launch: &SshTuiLaunch) -> Result<Value> {
             "startup",
             "raw_input_escape",
             "resize",
+            "surface_tabs_hotkeys",
             "sftp_browser",
+            "sftp_picker",
+            "sftp_filter",
+            "sftp_selection_memory",
+            "page_keys",
+            "transcript_viewer_follow",
+            "non_modal_error_banner",
+            "loading_markers",
+            "quit_confirmation",
             "forwarding",
             "shared_session_context",
             "external_agent_session_share",
@@ -694,6 +755,9 @@ fn preflight_value(launch: &SshTuiLaunch) -> Value {
             "transfer_planning",
             "forwarding_monitor",
             "session_monitor",
+            "transcript_viewer",
+            "sftp_picker",
+            "quit_confirmation",
             "external_agent_session_share",
             "agent_operation_review",
             "auth_failure",
@@ -847,18 +911,29 @@ struct SshTuiApp {
     sftp_path: String,
     sftp_entries: Vec<SftpEntryView>,
     sftp_selected: usize,
+    sftp_filter: String,
+    sftp_filter_input: bool,
+    sftp_pending: bool,
+    sftp_picker_query: String,
+    sftp_picker_selected: usize,
+    sftp_selection_memory: HashMap<String, usize>,
     transfer_plan: Option<TransferPlanView>,
     forward_rules: Vec<ForwardRuleView>,
     forward_selected: usize,
     forward_plan: Option<ForwardPlanView>,
     metrics: Option<MetricsView>,
     metrics_started: bool,
+    metrics_pending: bool,
     terminal_parser: vt100::Parser,
     terminal_size: TerminalGridSize,
     terminal_lines: Vec<String>,
     status: String,
     mode: Mode,
     return_mode: Mode,
+    overlay: Overlay,
+    error_banner: Option<String>,
+    transcript_follow: bool,
+    transcript_scroll: usize,
     host_key_prompt: Option<HostKeyPrompt>,
     assist_fallback_session: PluginSessionDescriptor,
     assist_request: Option<AssistRequest>,
@@ -968,12 +1043,19 @@ impl SshTuiApp {
             sftp_path: data.sftp_path,
             sftp_entries: data.sftp_entries,
             sftp_selected: 0,
+            sftp_filter: String::new(),
+            sftp_filter_input: false,
+            sftp_pending: false,
+            sftp_picker_query: String::new(),
+            sftp_picker_selected: 0,
+            sftp_selection_memory: HashMap::new(),
             transfer_plan: None,
             forward_rules: data.forward_rules,
             forward_selected: 0,
             forward_plan: None,
             metrics: data.metrics,
             metrics_started: false,
+            metrics_pending: false,
             terminal_parser,
             terminal_size,
             terminal_lines: data
@@ -985,6 +1067,10 @@ impl SshTuiApp {
             status: data.status,
             mode: Mode::Terminal,
             return_mode: Mode::Terminal,
+            overlay: Overlay::None,
+            error_banner: None,
+            transcript_follow: true,
+            transcript_scroll: 0,
             host_key_prompt: None,
             assist_fallback_session,
             assist_request: None,
@@ -1084,6 +1170,7 @@ impl SshTuiApp {
             SshEvent::Disconnected => {
                 self.clear_session_subsystems();
                 self.close_pty_owner("session disconnected");
+                self.overlay = Overlay::None;
                 self.mode = Mode::Disconnected;
                 self.status =
                     "disconnected; press Ctrl+] then r to reconnect or q to quit".to_string();
@@ -1095,6 +1182,7 @@ impl SshTuiApp {
                 retry_in_secs,
             } => {
                 self.close_pty_owner("session reconnecting");
+                self.overlay = Overlay::None;
                 self.mode = Mode::Disconnected;
                 self.status =
                     format!("reconnecting attempt {attempt}/{max_attempts} in {retry_in_secs:.1}s");
@@ -1102,6 +1190,7 @@ impl SshTuiApp {
             SshEvent::ReconnectFailed => {
                 self.clear_session_subsystems();
                 self.close_pty_owner("reconnect failed");
+                self.overlay = Overlay::None;
                 self.mode = Mode::Error;
                 self.status = "reconnect failed; press Ctrl+] then q to quit".to_string();
                 self.push_line("[local] reconnect failed");
@@ -1109,6 +1198,7 @@ impl SshTuiApp {
             SshEvent::Error(message) => {
                 self.clear_session_subsystems();
                 self.close_pty_owner("session error");
+                self.overlay = Overlay::None;
                 self.mode = Mode::Error;
                 self.status = safe_error_summary(&message);
                 self.push_line(&format!("[local] {}", self.status));
@@ -1121,6 +1211,9 @@ impl SshTuiApp {
                 reply,
             } => {
                 self.close_pty_owner("host key decision pending");
+                // The host-key decision is mandatory; never leave a stacked
+                // overlay hiding it.
+                self.overlay = Overlay::None;
                 self.mode = Mode::HostKeyPrompt;
                 self.status = "host key decision required".to_string();
                 self.host_key_prompt = Some(HostKeyPrompt {
@@ -1139,9 +1232,14 @@ impl SshTuiApp {
             }
             SshEvent::SftpClosed => {
                 self.sftp_handle = None;
+                self.sftp_pending = false;
                 self.status = "sftp closed".to_string();
             }
             SshEvent::SftpError(message) => {
+                // SFTP failures are background errors: they surface as a
+                // non-modal banner instead of hijacking the active surface.
+                self.sftp_pending = false;
+                self.error_banner = Some(safe_error_summary(&message));
                 self.status = safe_error_summary(&message);
             }
             SshEvent::ForwardStatusChanged { id, status } => {
@@ -1151,9 +1249,12 @@ impl SshTuiApp {
             }
             SshEvent::MetricsUpdate(metrics) => {
                 self.metrics = Some(MetricsView::from_system(metrics));
+                self.metrics_pending = false;
                 self.status = "metrics updated".to_string();
             }
             SshEvent::MetricsError(message) => {
+                self.metrics_pending = false;
+                self.error_banner = Some(safe_error_summary(&message));
                 self.status = safe_error_summary(&message);
             }
         }
@@ -1161,10 +1262,14 @@ impl SshTuiApp {
 
     fn handle_key(&mut self, key: KeyEvent) {
         self.expire_pty_owner_if_needed();
+        // The error banner is informational: any key acknowledges it while
+        // the key itself keeps its normal meaning, so background SFTP or
+        // metrics failures never trap the operator in a modal.
+        self.error_banner = None;
         if is_escape_layer_key(key) {
             self.escape_armed = true;
             self.status =
-                "escape: q quit, r reconnect, s sftp, f forwarding, m monitor, a agent-share, v revoke, ? help"
+                "escape: q quit, r reconnect, s sftp, f forwarding, m monitor, l transcript, a agent-share, v revoke, ? help"
                     .to_string();
             return;
         }
@@ -1179,51 +1284,52 @@ impl SshTuiApp {
             return;
         }
 
-        match self.mode {
-            Mode::AgentOperationReview => {
-                self.handle_assist_response_key(key);
-                return;
-            }
-            Mode::Help => {
-                self.mode = self.return_mode;
-                self.status = format!("returned to {}", mode_label(self.mode));
-                return;
-            }
-            _ => {}
+        // Overlay-first routing for stacked surfaces. Raw terminal input is
+        // never routed here: with `Overlay::None` and no overlay-reachable
+        // mode, fall through to the unchanged PTY path below.
+        if self.overlay != Overlay::None {
+            self.handle_overlay_key(key);
+            return;
+        }
+
+        if self.mode == Mode::AgentOperationReview {
+            self.handle_assist_response_key(key);
+            return;
         }
 
         match self.mode {
-            Mode::HostKeyPrompt => {
-                self.handle_host_key_key(key);
-                return;
+            Mode::Sftp => self.handle_sftp_key(key),
+            Mode::Forwarding => self.handle_forwarding_key(key),
+            Mode::Monitor => self.handle_monitor_key(key),
+            Mode::Disconnected | Mode::Error => self.handle_recovery_key(key),
+            _ => {
+                if let Some(bytes) = key_to_pty_bytes(key) {
+                    self.write_human_pty_input(bytes);
+                }
             }
-            Mode::Sftp => {
-                self.handle_sftp_key(key);
-                return;
-            }
-            Mode::Forwarding => {
-                self.handle_forwarding_key(key);
-                return;
-            }
-            Mode::Monitor => {
-                self.handle_monitor_key(key);
-                return;
-            }
-            Mode::Disconnected | Mode::Error => {
-                self.handle_recovery_key(key);
-                return;
-            }
-            _ => {}
         }
+    }
 
-        if let Some(bytes) = key_to_pty_bytes(key) {
-            self.write_human_pty_input(bytes);
+    fn handle_overlay_key(&mut self, key: KeyEvent) {
+        match self.overlay {
+            Overlay::None => {}
+            Overlay::Help => {
+                self.overlay = Overlay::None;
+                self.status = "help closed".to_string();
+            }
+            Overlay::TranscriptViewer => self.handle_transcript_viewer_key(key),
+            Overlay::SftpPicker => self.handle_sftp_picker_key(key),
+            Overlay::ConfirmQuit => self.handle_confirm_quit_key(key),
         }
     }
 
     fn handle_paste(&mut self, text: &str) {
         self.expire_pty_owner_if_needed();
-        if text.is_empty() || self.escape_armed || self.mode != Mode::Terminal {
+        if text.is_empty()
+            || self.escape_armed
+            || self.overlay != Overlay::None
+            || self.mode != Mode::Terminal
+        {
             return;
         }
 
@@ -1232,12 +1338,16 @@ impl SshTuiApp {
 
     fn handle_escape_key(&mut self, key: KeyEvent) {
         self.escape_armed = false;
+        // Escape commands act on the base surface; drop any stacked overlay
+        // first so a surface switch never leaves a stale overlay behind.
+        self.overlay = Overlay::None;
         match key.code {
-            KeyCode::Char('q') => self.should_quit = true,
+            KeyCode::Char('q') => self.request_quit(),
             KeyCode::Char('r') => self.request_reconnect(),
             KeyCode::Char('s') => self.open_sftp(),
             KeyCode::Char('f') => self.open_forwarding(),
             KeyCode::Char('m') => self.open_monitor(),
+            KeyCode::Char('l') => self.open_transcript_viewer(),
             KeyCode::Char('a') => self.share_current_session_with_agent(),
             KeyCode::Char('v') => self.revoke_pty_control("human escape revoke"),
             KeyCode::Char('t') => {
@@ -1256,7 +1366,7 @@ impl SshTuiApp {
 
     fn handle_recovery_key(&mut self, key: KeyEvent) {
         match key.code {
-            KeyCode::Char('q') => self.should_quit = true,
+            KeyCode::Char('q') => self.request_quit(),
             KeyCode::Char('r') => self.request_reconnect(),
             KeyCode::Char('?') => self.show_help(),
             KeyCode::Esc => {
@@ -1269,9 +1379,169 @@ impl SshTuiApp {
     }
 
     fn show_help(&mut self) {
-        self.return_mode = self.mode;
-        self.mode = Mode::Help;
-        self.status = "help".to_string();
+        self.overlay = Overlay::Help;
+        self.status = "help open; any key closes".to_string();
+    }
+
+    /// Quit immediately when nothing live is running; otherwise stage the
+    /// non-modal confirmation overlay so a stray `q` cannot kill a live SSH
+    /// session, an open SFTP subsystem, an in-flight transfer, active
+    /// forwards, agent PTY control, or a pending agent session share.
+    fn request_quit(&mut self) {
+        if let Some(active) = self.active_work_summary() {
+            self.overlay = Overlay::ConfirmQuit;
+            self.status = format!("quit? active work: {active} - y quits, any other key stays");
+            return;
+        }
+        self.should_quit = true;
+    }
+
+    fn handle_confirm_quit_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Enter => {
+                self.should_quit = true;
+            }
+            _ => {
+                self.overlay = Overlay::None;
+                self.status = "quit cancelled".to_string();
+            }
+        }
+    }
+
+    fn active_work_summary(&self) -> Option<String> {
+        let mut parts: Vec<String> = Vec::new();
+        if self.service.is_some() && !matches!(self.mode, Mode::Disconnected | Mode::Error) {
+            parts.push("live SSH session".to_string());
+        }
+        if self.host_key_prompt.is_some() {
+            parts.push("host key decision pending".to_string());
+        }
+        if self.sftp_handle.is_some() {
+            parts.push("sftp subsystem open".to_string());
+        }
+        if let Some(plan) = &self.transfer_plan {
+            if plan.progress.is_some() {
+                parts.push(format!("{} in progress", plan.kind.label()));
+            } else {
+                parts.push(format!("staged {} plan", plan.kind.label()));
+            }
+        }
+        if self.forward_plan.is_some() {
+            parts.push("staged forward plan".to_string());
+        }
+        if self.service.is_some() {
+            let active_rules = self
+                .forward_rules
+                .iter()
+                .filter(|rule| matches!(rule.status.as_str(), "active" | "starting"))
+                .count();
+            if active_rules > 0 {
+                parts.push(format!("{active_rules} active forwarding rules"));
+            }
+        }
+        if !matches!(
+            self.pty_input_owner,
+            PtyInputOwnerState::HumanActive | PtyInputOwnerState::Closed { .. }
+        ) {
+            parts.push("agent owns PTY input".to_string());
+        }
+        if self
+            .assist_request
+            .as_ref()
+            .is_some_and(|request| !request.status.is_terminal())
+        {
+            parts.push("agent session share active".to_string());
+        }
+        (!parts.is_empty()).then(|| parts.join(", "))
+    }
+
+    /// Open the full-screen scrollable transcript viewer over the retained
+    /// terminal output. Reached through the escape layer or the monitor, so
+    /// raw PTY input is never captured by it.
+    fn open_transcript_viewer(&mut self) {
+        self.overlay = Overlay::TranscriptViewer;
+        self.transcript_follow = true;
+        self.transcript_scroll = 0;
+        self.status = "transcript viewer: j/k PgUp/PgDn scroll, f follow, Esc closes".to_string();
+    }
+
+    fn handle_transcript_viewer_key(&mut self, key: KeyEvent) {
+        let total = self.terminal_lines.len();
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.overlay = Overlay::None;
+                self.status = "transcript viewer closed".to_string();
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.transcript_follow = false;
+                self.transcript_scroll = self.transcript_scroll.saturating_add(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.transcript_scroll = self.transcript_scroll.saturating_sub(1);
+                if self.transcript_scroll == 0 {
+                    self.transcript_follow = true;
+                }
+            }
+            KeyCode::PageUp => {
+                self.transcript_follow = false;
+                self.transcript_scroll = self.transcript_scroll.saturating_add(PAGE_STEP as usize);
+            }
+            KeyCode::PageDown => {
+                self.transcript_scroll = self.transcript_scroll.saturating_sub(PAGE_STEP as usize);
+                if self.transcript_scroll == 0 {
+                    self.transcript_follow = true;
+                }
+            }
+            KeyCode::Home | KeyCode::Char('g') => {
+                self.transcript_follow = false;
+                self.transcript_scroll = total;
+            }
+            KeyCode::End | KeyCode::Char('G') => {
+                self.transcript_follow = true;
+                self.transcript_scroll = 0;
+            }
+            KeyCode::Char('f') => {
+                self.transcript_follow = !self.transcript_follow;
+                if self.transcript_follow {
+                    self.transcript_scroll = 0;
+                }
+                self.status = format!(
+                    "transcript follow {}",
+                    if self.transcript_follow { "on" } else { "off" }
+                );
+            }
+            _ => {}
+        }
+    }
+
+    /// Cycle the browsing surfaces (SFTP, forwarding, monitor). Never called
+    /// from the terminal surface: Tab there is raw PTY input.
+    fn cycle_browsing_surface(&mut self, delta: isize) {
+        let current = self.current_surface();
+        let start = BROWSING_SURFACES
+            .iter()
+            .position(|surface| *surface == current)
+            .unwrap_or(0);
+        let count = BROWSING_SURFACES.len() as isize;
+        let next = BROWSING_SURFACES[((start as isize + delta).rem_euclid(count)) as usize];
+        match next {
+            Surface::Sftp => self.open_sftp(),
+            Surface::Forwarding => self.open_forwarding(),
+            Surface::Monitor => self.open_monitor(),
+            Surface::Terminal => {
+                self.mode = Mode::Terminal;
+                self.status = "returned to terminal".to_string();
+            }
+        }
+    }
+
+    fn current_surface(&self) -> Surface {
+        match self.mode {
+            Mode::Sftp => Surface::Sftp,
+            Mode::Forwarding => Surface::Forwarding,
+            Mode::Monitor => Surface::Monitor,
+            _ => Surface::Terminal,
+        }
     }
 
     /// Publish or refresh the current live SSH session for an external agent.
@@ -2185,6 +2455,9 @@ impl SshTuiApp {
             if self.mode != Mode::AgentOperationReview {
                 self.return_mode = self.mode;
             }
+            // The operation review is safety-critical: never leave a stacked
+            // overlay hiding it.
+            self.overlay = Overlay::None;
             self.mode = Mode::AgentOperationReview;
             self.status = "external agent requests an operation on this session".to_string();
         }
@@ -2324,12 +2597,13 @@ impl SshTuiApp {
     fn request_sftp_list(&mut self) {
         if let Some(handle) = &self.sftp_handle {
             handle.send(SftpCommand::ListDir(self.sftp_path.clone()));
+            self.sftp_pending = true;
             self.status = format!("listing {}", self.sftp_path);
         } else if self.service.is_none() {
             self.status = format!(
                 "fixture directory {} has {} entries",
                 self.sftp_path,
-                self.sftp_entries.len()
+                self.filtered_sftp_entries().len()
             );
         } else {
             self.status = "sftp subsystem is not ready".to_string();
@@ -2342,9 +2616,10 @@ impl SshTuiApp {
                 self.sftp_path = path;
                 self.sftp_entries = entries.into_iter().map(SftpEntryView::from).collect();
                 self.sftp_entries.sort_by(sftp_entry_sort);
+                self.sftp_pending = false;
                 self.sftp_selected = self
                     .sftp_selected
-                    .min(self.sftp_entries.len().saturating_sub(1));
+                    .min(self.filtered_sftp_entries().len().saturating_sub(1));
                 self.status = format!(
                     "listed {} entries in {}",
                     self.sftp_entries.len(),
@@ -2352,6 +2627,8 @@ impl SshTuiApp {
                 );
             }
             SftpEvent::Error(message) => {
+                self.sftp_pending = false;
+                self.error_banner = Some(safe_error_summary(&message));
                 self.status = safe_error_summary(&message);
                 if let Some(plan) = &mut self.transfer_plan {
                     plan.progress = None;
@@ -2395,20 +2672,32 @@ impl SshTuiApp {
     }
 
     fn handle_sftp_key(&mut self, key: KeyEvent) {
+        if self.sftp_filter_input {
+            self.handle_sftp_filter_key(key);
+            return;
+        }
         match key.code {
             KeyCode::Up | KeyCode::Char('k') => self.move_sftp_selection(-1),
             KeyCode::Down | KeyCode::Char('j') => self.move_sftp_selection(1),
-            KeyCode::Home | KeyCode::Char('g') => self.sftp_selected = 0,
+            KeyCode::PageUp => self.move_sftp_selection(-PAGE_STEP),
+            KeyCode::PageDown => self.move_sftp_selection(PAGE_STEP),
+            KeyCode::Home | KeyCode::Char('g') => self.set_sftp_selected(0),
             KeyCode::End | KeyCode::Char('G') => {
-                self.sftp_selected = self.sftp_entries.len().saturating_sub(1);
+                let len = self.filtered_sftp_entries().len();
+                self.set_sftp_selected(len.saturating_sub(1));
             }
             KeyCode::Enter => self.open_selected_sftp_entry(),
             KeyCode::Backspace => {
+                self.remember_sftp_selection();
                 self.sftp_path = remote_parent_path(&self.sftp_path);
-                self.sftp_selected = 0;
+                self.sftp_selected = self.restore_sftp_selection(&self.sftp_path);
                 self.request_sftp_list();
             }
+            KeyCode::Tab => self.cycle_browsing_surface(1),
+            KeyCode::BackTab => self.cycle_browsing_surface(-1),
             KeyCode::Char('r') | KeyCode::F(5) => self.request_sftp_list(),
+            KeyCode::Char('/') => self.open_sftp_filter(),
+            KeyCode::Char('p') => self.open_sftp_picker(),
             KeyCode::Char('d') => self.plan_download(),
             KeyCode::Char('u') => self.plan_upload(),
             KeyCode::Char('x') | KeyCode::Delete => self.plan_delete(),
@@ -2420,53 +2709,201 @@ impl SshTuiApp {
                 self.mode = Mode::Terminal;
                 self.status = "returned to terminal".to_string();
             }
+            KeyCode::Char('q') => self.request_quit(),
             KeyCode::Char('?') => self.show_help(),
             KeyCode::Esc => {
                 if self.transfer_plan.is_some() {
                     self.cancel_sftp_plan();
                 } else {
+                    if !self.sftp_filter.is_empty() {
+                        self.sftp_filter.clear();
+                        self.set_sftp_selected(0);
+                    }
                     self.mode = Mode::Terminal;
                     self.status = "returned to terminal".to_string();
                 }
             }
             _ => {
                 self.status =
-                    "sftp: j/k navigate, Enter open, d download, u upload, x delete".to_string();
+                    "sftp: j/k navigate, / filter, p pick, Enter open, d download, u upload, x delete"
+                        .to_string();
             }
         }
     }
 
+    fn filtered_sftp_entries(&self) -> Vec<SftpEntryView> {
+        let needle = self.sftp_filter.to_lowercase();
+        self.sftp_entries
+            .iter()
+            .filter(|entry| needle.is_empty() || entry.name.to_lowercase().contains(&needle))
+            .cloned()
+            .collect()
+    }
+
+    fn set_sftp_selected(&mut self, value: usize) {
+        let len = self.filtered_sftp_entries().len();
+        self.sftp_selected = value.min(len.saturating_sub(1));
+    }
+
+    fn open_sftp_filter(&mut self) {
+        self.sftp_filter_input = true;
+        self.status = "sftp filter: type to narrow live, Enter apply, Esc clear".to_string();
+    }
+
+    fn handle_sftp_filter_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Enter => {
+                self.sftp_filter_input = false;
+                self.set_sftp_selected(0);
+                self.status = format!(
+                    "filter applied: {} ({} matches)",
+                    self.sftp_filter_label(),
+                    self.filtered_sftp_entries().len()
+                );
+            }
+            KeyCode::Esc => {
+                self.sftp_filter.clear();
+                self.sftp_filter_input = false;
+                self.set_sftp_selected(0);
+                self.status = "filter cleared".to_string();
+            }
+            KeyCode::Backspace => {
+                self.sftp_filter.pop();
+                self.set_sftp_selected(0);
+            }
+            KeyCode::Char(ch) => {
+                self.sftp_filter.push(ch);
+                self.set_sftp_selected(0);
+            }
+            _ => {}
+        }
+    }
+
+    fn sftp_filter_label(&self) -> String {
+        if self.sftp_filter.is_empty() {
+            "none".to_string()
+        } else {
+            self.sftp_filter.clone()
+        }
+    }
+
+    /// Per-path selection memory: the row held in a directory is restored
+    /// when the operator navigates back to it.
+    fn remember_sftp_selection(&mut self) {
+        self.sftp_selection_memory
+            .insert(self.sftp_path.clone(), self.sftp_selected);
+    }
+
+    fn restore_sftp_selection(&self, path: &str) -> usize {
+        self.sftp_selection_memory.get(path).copied().unwrap_or(0)
+    }
+
     fn move_sftp_selection(&mut self, delta: isize) {
-        if self.sftp_entries.is_empty() {
+        let len = self.filtered_sftp_entries().len();
+        if len == 0 {
             self.sftp_selected = 0;
             return;
         }
-        let last = self.sftp_entries.len() as isize - 1;
+        let last = len as isize - 1;
         let next = (self.sftp_selected as isize + delta).clamp(0, last);
         self.sftp_selected = next as usize;
     }
 
     fn open_selected_sftp_entry(&mut self) {
-        let Some(entry) = self.selected_sftp_entry().cloned() else {
+        let Some(entry) = self.selected_sftp_entry() else {
             self.status = "sftp directory is empty".to_string();
             return;
         };
 
         if entry.is_dir {
+            self.remember_sftp_selection();
             self.sftp_path = remote_child_path(&self.sftp_path, &entry.name);
-            self.sftp_selected = 0;
+            self.sftp_selected = self.restore_sftp_selection(&self.sftp_path);
             self.request_sftp_list();
         } else {
             self.status = format!("selected {}; press d to plan download", entry.name);
         }
     }
 
-    fn selected_sftp_entry(&self) -> Option<&SftpEntryView> {
-        self.sftp_entries.get(self.sftp_selected)
+    fn selected_sftp_entry(&self) -> Option<SftpEntryView> {
+        self.filtered_sftp_entries()
+            .get(self.sftp_selected)
+            .cloned()
+    }
+
+    fn open_sftp_picker(&mut self) {
+        if self.sftp_entries.is_empty() {
+            self.status = "no sftp entries to pick; press r to refresh".to_string();
+            return;
+        }
+        self.sftp_picker_query.clear();
+        self.sftp_picker_selected = 0;
+        self.overlay = Overlay::SftpPicker;
+        self.status = "entry picker: type to narrow, Enter selects, Esc closes".to_string();
+    }
+
+    fn filtered_sftp_picker_entries(&self) -> Vec<SftpEntryView> {
+        let needle = self.sftp_picker_query.to_lowercase();
+        self.sftp_entries
+            .iter()
+            .filter(|entry| needle.is_empty() || entry.name.to_lowercase().contains(&needle))
+            .cloned()
+            .collect()
+    }
+
+    fn handle_sftp_picker_key(&mut self, key: KeyEvent) {
+        let matches = self.filtered_sftp_picker_entries();
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.overlay = Overlay::None;
+                self.status = "entry picker closed".to_string();
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.sftp_picker_selected = self.sftp_picker_selected.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if !matches.is_empty() {
+                    self.sftp_picker_selected =
+                        (self.sftp_picker_selected + 1).min(matches.len() - 1);
+                }
+            }
+            KeyCode::Enter => self.apply_sftp_picker_selection(matches),
+            KeyCode::Backspace => {
+                self.sftp_picker_query.pop();
+                self.sftp_picker_selected = 0;
+            }
+            KeyCode::Char(ch) => {
+                self.sftp_picker_query.push(ch);
+                self.sftp_picker_selected = 0;
+            }
+            _ => {}
+        }
+    }
+
+    fn apply_sftp_picker_selection(&mut self, matches: Vec<SftpEntryView>) {
+        let Some(entry) = matches.get(self.sftp_picker_selected).cloned() else {
+            self.status = "no entry matches the picker filter".to_string();
+            return;
+        };
+        self.overlay = Overlay::None;
+        let index = self
+            .filtered_sftp_entries()
+            .iter()
+            .position(|candidate| candidate.name == entry.name)
+            .unwrap_or(0);
+        self.sftp_selected = index;
+        if entry.is_dir {
+            self.open_selected_sftp_entry();
+        } else {
+            self.status = format!(
+                "picker selected {}; press Enter to open, d to download",
+                entry.name
+            );
+        }
     }
 
     fn plan_download(&mut self) {
-        let Some(entry) = self.selected_sftp_entry().cloned() else {
+        let Some(entry) = self.selected_sftp_entry() else {
             self.status = "no remote file selected".to_string();
             return;
         };
@@ -2500,7 +2937,7 @@ impl SshTuiApp {
     }
 
     fn plan_delete(&mut self) {
-        let Some(entry) = self.selected_sftp_entry().cloned() else {
+        let Some(entry) = self.selected_sftp_entry() else {
             self.status = "no remote entry selected".to_string();
             return;
         };
@@ -2645,9 +3082,7 @@ impl SshTuiApp {
             .find(|part| !part.is_empty())
             .unwrap_or(remote);
         self.sftp_entries.retain(|entry| entry.name != name);
-        self.sftp_selected = self
-            .sftp_selected
-            .min(self.sftp_entries.len().saturating_sub(1));
+        self.set_sftp_selected(self.sftp_selected);
     }
 
     fn open_forwarding(&mut self) {
@@ -2660,6 +3095,10 @@ impl SshTuiApp {
         match key.code {
             KeyCode::Up | KeyCode::Char('k') => self.move_forward_selection(-1),
             KeyCode::Down | KeyCode::Char('j') => self.move_forward_selection(1),
+            KeyCode::PageUp => self.move_forward_selection(-PAGE_STEP),
+            KeyCode::PageDown => self.move_forward_selection(PAGE_STEP),
+            KeyCode::Tab => self.cycle_browsing_surface(1),
+            KeyCode::BackTab => self.cycle_browsing_surface(-1),
             KeyCode::Char('l') => self.plan_forward(ForwardType::Local {
                 bind_addr: "127.0.0.1".to_string(),
                 bind_port: 18080,
@@ -2684,6 +3123,7 @@ impl SshTuiApp {
                 self.mode = Mode::Terminal;
                 self.status = "returned to terminal".to_string();
             }
+            KeyCode::Char('q') => self.request_quit(),
             KeyCode::Char('?') => self.show_help(),
             _ => {
                 self.status =
@@ -2798,6 +3238,7 @@ impl SshTuiApp {
                 self.metrics_started = true;
             }
             service.send(SshCommand::Metrics(MetricsServiceCommand::Refresh));
+            self.metrics_pending = true;
             self.status = "metrics refresh requested".to_string();
         } else {
             self.status = "fixture session monitor".to_string();
@@ -2807,15 +3248,20 @@ impl SshTuiApp {
     fn handle_monitor_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Char('r') | KeyCode::F(5) => self.open_monitor(),
+            KeyCode::Char('l') => self.open_transcript_viewer(),
+            KeyCode::Tab => self.cycle_browsing_surface(1),
+            KeyCode::BackTab => self.cycle_browsing_surface(-1),
             KeyCode::Char('s') => self.open_sftp(),
             KeyCode::Char('f') => self.open_forwarding(),
             KeyCode::Char('t') | KeyCode::Esc => {
                 self.mode = Mode::Terminal;
                 self.status = "returned to terminal".to_string();
             }
+            KeyCode::Char('q') => self.request_quit(),
             KeyCode::Char('?') => self.show_help(),
             _ => {
-                self.status = "monitor: r refresh, s sftp, f forwarding, t terminal".to_string();
+                self.status = "monitor: r refresh, l transcript, s sftp, f forwarding, t terminal"
+                    .to_string();
             }
         }
     }
@@ -2825,12 +3271,7 @@ impl SshTuiApp {
         self.sync_terminal_size_for_area(area);
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(3),
-                Constraint::Min(8),
-                Constraint::Length(3),
-                Constraint::Length(1),
-            ])
+            .constraints(tui_layout_constraints())
             .split(area);
 
         self.draw_header(frame, chunks[0]);
@@ -2841,14 +3282,21 @@ impl SshTuiApp {
             _ => self.draw_terminal(frame, chunks[1]),
         }
         self.draw_status(frame, chunks[2]);
-        self.draw_help_line(frame, chunks[3]);
 
         if self.mode == Mode::HostKeyPrompt {
             self.draw_host_key_prompt(frame, centered_rect(74, 38, area));
         } else if self.mode == Mode::AgentOperationReview {
             self.draw_assist_response(frame, centered_rect(82, 62, area));
-        } else if self.mode == Mode::Help {
-            self.draw_help(frame, centered_rect(72, 46, area));
+        }
+        match self.overlay {
+            Overlay::None => {}
+            Overlay::Help => self.draw_help(frame, centered_rect(72, 46, area)),
+            Overlay::TranscriptViewer => self.draw_transcript_viewer(frame, area),
+            Overlay::SftpPicker => self.draw_sftp_picker(frame, area),
+            Overlay::ConfirmQuit => self.draw_confirm_quit(frame, area),
+        }
+        if let Some(error) = &self.error_banner {
+            self.draw_error_banner(frame, area, error);
         }
     }
 
@@ -2859,7 +3307,7 @@ impl SshTuiApp {
             SshTuiSource::Fixture => "fixture",
         };
         let title = format!("SSH TUI - {}", self.target_label);
-        let line = Line::from(vec![
+        let title_line = Line::from(vec![
             Span::styled(title, Style::default().add_modifier(Modifier::BOLD)),
             Span::raw(" | "),
             Span::raw(format!("profile {}", self.profile_label)),
@@ -2868,8 +3316,27 @@ impl SshTuiApp {
             Span::raw(" | "),
             Span::raw(format!("auth {}", self.auth_method)),
         ]);
+        let tabs = Surface::ALL
+            .iter()
+            .map(|surface| {
+                let pending = match surface {
+                    Surface::Sftp => self.sftp_pending,
+                    Surface::Monitor => self.metrics_pending,
+                    _ => false,
+                };
+                let mark = if pending { "\u{27f3}" } else { "" };
+                let label = format!("{} {}{}", surface.hotkey(), surface.label(), mark);
+                if *surface == self.current_surface() {
+                    format!("[{label}]")
+                } else {
+                    label
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("  ");
+        let tabs_line = Line::from(format!("{tabs}  \u{b7}  Tab cycles surfaces"));
         frame.render_widget(
-            Paragraph::new(line)
+            Paragraph::new(vec![title_line, tabs_line])
                 .block(Block::default().borders(Borders::ALL))
                 .alignment(Alignment::Left),
             area,
@@ -2891,12 +3358,11 @@ impl SshTuiApp {
             .constraints([Constraint::Percentage(62), Constraint::Percentage(38)])
             .split(area);
 
+        let entries = self.filtered_sftp_entries();
         let visible_height = chunks[0].height.saturating_sub(2) as usize;
-        let start = window_start(self.sftp_selected, visible_height, self.sftp_entries.len());
-        let lines = if self.sftp_entries.is_empty() {
-            vec![Line::from("No entries loaded. Press r to refresh.")]
-        } else {
-            self.sftp_entries[start..]
+        let start = window_start(self.sftp_selected, visible_height, entries.len());
+        let lines = if !entries.is_empty() {
+            entries[start..]
                 .iter()
                 .take(visible_height)
                 .enumerate()
@@ -2919,16 +3385,28 @@ impl SshTuiApp {
                         style,
                     ))
                 })
-                .collect()
+                .collect::<Vec<_>>()
+        } else if self.sftp_pending {
+            vec![Line::from("loading\u{2026}")]
+        } else {
+            vec![Line::from("No entries loaded. Press r to refresh.")]
+        };
+
+        let title = if self.sftp_filter.is_empty() {
+            format!("SFTP {}", self.sftp_path)
+        } else {
+            format!(
+                "SFTP {} \u{b7} filter '{}' \u{b7} {}/{} entries",
+                self.sftp_path,
+                self.sftp_filter,
+                entries.len(),
+                self.sftp_entries.len()
+            )
         };
 
         frame.render_widget(
             Paragraph::new(lines)
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .title(format!("SFTP {}", self.sftp_path)),
-                )
+                .block(Block::default().borders(Borders::ALL).title(title))
                 .wrap(Wrap { trim: false }),
             chunks[0],
         );
@@ -3130,20 +3608,9 @@ impl SshTuiApp {
     }
 
     fn draw_status(&self, frame: &mut Frame, area: Rect) {
-        let mode = match self.mode {
-            Mode::Terminal => "terminal",
-            Mode::Sftp => "sftp",
-            Mode::Forwarding => "forwarding",
-            Mode::Monitor => "monitor",
-            Mode::HostKeyPrompt => "host-key",
-            Mode::AgentOperationReview => "agent-operation-review",
-            Mode::Help => "help",
-            Mode::Disconnected => "disconnected",
-            Mode::Error => "error",
-        };
-        let line = Line::from(vec![
+        let status_line = Line::from(vec![
             Span::styled(
-                format!("{mode} "),
+                format!("{} ", mode_label(self.mode)),
                 Style::default()
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
@@ -3159,27 +3626,195 @@ impl SshTuiApp {
                 self.restore
             )),
         ]);
+        // The key-hint footer is persistent and sized to stay on one line at
+        // ~120 columns.
+        let hints_line = Line::from(Span::styled(
+            self.hint_footer(),
+            Style::default().fg(Color::DarkGray),
+        ));
         frame.render_widget(
-            Paragraph::new(line).block(Block::default().borders(Borders::ALL).title("Status")),
+            Paragraph::new(vec![status_line, hints_line])
+                .block(Block::default().borders(Borders::ALL).title("Status")),
             area,
         );
     }
 
-    fn draw_help_line(&self, frame: &mut Frame, area: Rect) {
-        let text = if self.escape_armed {
-            "escape armed: q quit | r reconnect | s sftp | f forwarding | m monitor | a share/refresh agent session | v revoke | t terminal | ? help"
-        } else if self.mode == Mode::Sftp {
-            "sftp: j/k move | Enter open | Backspace parent | d/u/x plan | y confirm | t terminal"
-        } else if self.mode == Mode::Forwarding {
-            "forwarding: j/k move | l/r/d plan | y start | x stop | s sftp | m monitor | t terminal"
-        } else if self.mode == Mode::Monitor {
-            "monitor: r refresh | s sftp | f forwarding | t terminal"
+    fn hint_footer(&self) -> String {
+        if self.escape_armed {
+            // Sized to stay on one line down to ~120-column terminals.
+            "escape armed: q quit \u{b7} r reconnect \u{b7} s/f/m surfaces \u{b7} l transcript \u{b7} a share \u{b7} v revoke \u{b7} t terminal \u{b7} ? help"
+                .to_string()
+        } else if self.overlay == Overlay::Help {
+            "help: any key closes".to_string()
+        } else if self.overlay == Overlay::TranscriptViewer {
+            "transcript: j/k PgUp/PgDn scroll | f follow | g/G home/end | Esc close".to_string()
+        } else if self.overlay == Overlay::SftpPicker {
+            "picker: type to narrow | Enter select | Esc close".to_string()
+        } else if self.overlay == Overlay::ConfirmQuit {
+            "quit: y/Enter quit | any other key stays".to_string()
+        } else if self.mode == Mode::HostKeyPrompt {
+            "host key: y/a accept | n/r/Esc reject".to_string()
         } else if self.mode == Mode::AgentOperationReview {
-            "agent operation: j/k select | y approve once | A allow this agent for session | n deny | Enter/q return | c close"
+            "agent operation: j/k select | y approve once | A allow this agent for session | n deny | Enter/q return | c close".to_string()
+        } else if self.mode == Mode::Sftp {
+            if self.sftp_filter_input {
+                format!(
+                    "filter: {}\u{258f} Enter apply \u{b7} Esc clear \u{b7} {} match(es)",
+                    safe_inline(&self.sftp_filter, 48),
+                    self.filtered_sftp_entries().len()
+                )
+            } else {
+                "sftp: j/k PgUp/PgDn move | / filter | p pick | Enter open | d/u/x plan | y confirm | Tab surface | t terminal | q quit".to_string()
+            }
+        } else if self.mode == Mode::Forwarding {
+            "forwarding: j/k PgUp/PgDn move | l/r/d plan | y start | x stop | s sftp | m monitor | t terminal | q quit".to_string()
+        } else if self.mode == Mode::Monitor {
+            "monitor: r refresh | l transcript | s sftp | f forwarding | t terminal | q quit"
+                .to_string()
+        } else if matches!(self.mode, Mode::Disconnected | Mode::Error) {
+            "recovery: r reconnect | q quit | ? help".to_string()
         } else {
-            "raw input active | Ctrl+] opens local escape layer"
+            "raw input active | Ctrl+] opens local escape layer".to_string()
+        }
+    }
+
+    fn draw_transcript_viewer(&self, frame: &mut Frame, area: Rect) {
+        let popup = centered_rect(88, 82, area);
+        frame.render_widget(Clear, popup);
+        let visible = popup.height.saturating_sub(2).max(1) as usize;
+        let total = self.terminal_lines.len();
+        let body: Vec<Line> = if total == 0 {
+            vec![Line::from("no terminal output retained yet")]
+        } else if self.transcript_follow {
+            let start = total.saturating_sub(visible);
+            self.terminal_lines[start..]
+                .iter()
+                .map(|line| Line::from(line.clone()))
+                .collect()
+        } else {
+            let end = total.saturating_sub(self.transcript_scroll);
+            let start = end.saturating_sub(visible);
+            self.terminal_lines[start..end]
+                .iter()
+                .map(|line| Line::from(line.clone()))
+                .collect()
         };
-        frame.render_widget(Paragraph::new(text), area);
+        let follow_label = if self.transcript_follow {
+            "follow=f on"
+        } else {
+            "follow=f off"
+        };
+        frame.render_widget(
+            Paragraph::new(body).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(format!(
+                        " Transcript \u{b7} {} lines retained \u{b7} {} \u{b7} j/k PgUp/PgDn scroll \u{b7} Esc close ",
+                        total, follow_label
+                    )),
+            ),
+            popup,
+        );
+    }
+
+    fn draw_sftp_picker(&self, frame: &mut Frame, area: Rect) {
+        let popup = centered_rect(60, 60, area);
+        frame.render_widget(Clear, popup);
+        let matches = self.filtered_sftp_picker_entries();
+        let visible = popup.height.saturating_sub(5).max(1) as usize;
+        let start = window_start(self.sftp_picker_selected, visible, matches.len());
+        let mut lines = vec![
+            Line::from(Span::styled(
+                format!("filter: {}\u{258f}", self.sftp_picker_query),
+                Style::default().fg(Color::Cyan),
+            )),
+            Line::from(""),
+        ];
+        if matches.is_empty() {
+            lines.push(Line::from("no entry matches the picker filter"));
+        } else {
+            lines.extend(matches.iter().enumerate().skip(start).take(visible).map(
+                |(idx, entry)| {
+                    let style = if idx == self.sftp_picker_selected {
+                        Style::default()
+                            .fg(Color::Black)
+                            .bg(Color::Green)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default()
+                    };
+                    Line::from(Span::styled(
+                        format!("  {}", sftp_entry_label(entry)),
+                        style,
+                    ))
+                },
+            ));
+        }
+        frame.render_widget(
+            Paragraph::new(lines)
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(format!(
+                            " Entries {}/{} \u{b7} type to narrow \u{b7} Enter select \u{b7} Esc close ",
+                            self.sftp_picker_selected.saturating_add(1).min(matches.len().max(1)),
+                            matches.len()
+                        )),
+                )
+                .wrap(Wrap { trim: false }),
+            popup,
+        );
+    }
+
+    fn draw_confirm_quit(&self, frame: &mut Frame, area: Rect) {
+        let popup = centered_rect(56, 22, area);
+        frame.render_widget(Clear, popup);
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::from(Span::styled(
+                    "Quit with active work?",
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                )),
+                Line::from(
+                    self.active_work_summary()
+                        .unwrap_or_else(|| "no active sessions, streams, or plans".to_string()),
+                ),
+                Line::from("y/Enter: quit \u{b7} any other key: stay"),
+            ])
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" Confirm Quit "),
+            )
+            .wrap(Wrap { trim: false }),
+            popup,
+        );
+    }
+
+    fn draw_error_banner(&self, frame: &mut Frame, area: Rect, error: &str) {
+        let banner = Rect {
+            x: area.x + 1,
+            y: area.height.saturating_sub(6),
+            width: area.width.saturating_sub(2),
+            height: 3,
+        };
+        frame.render_widget(Clear, banner);
+        frame.render_widget(
+            Paragraph::new(vec![Line::from(Span::styled(
+                safe_error_summary(error),
+                Style::default().fg(Color::Red),
+            ))])
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" Error (any key acknowledges) ")
+                    .style(Style::default().fg(Color::Red)),
+            )
+            .wrap(Wrap { trim: false }),
+            banner,
+        );
     }
 
     fn draw_host_key_prompt(&self, frame: &mut Frame, area: Rect) {
@@ -3326,12 +3961,26 @@ impl SshTuiApp {
             Line::from("Raw terminal input is sent to the SSH PTY."),
             Line::from("Ctrl+] opens the local escape layer."),
             Line::from(
-                "Escape commands: q quit, r reconnect, s sftp, f forwarding, m monitor, a share/refresh agent session, v revoke, t terminal.",
+                "Escape commands: q quit, r reconnect, s sftp, f forwarding, m monitor, l transcript, a share/refresh agent session, v revoke, t terminal.",
             ),
             Line::from("Host-key decisions use explicit a/r keys and display fingerprints only."),
-            Line::from("SFTP browser: j/k move, Enter open, d/u/x stage plans, y confirms."),
+            Line::from(
+                "SFTP browser: j/k/PgUp/PgDn move, / filters live, p opens the entry picker, Enter opens, d/u/x stage plans, y confirms.",
+            ),
+            Line::from(
+                "Selection is remembered per directory, so navigating away and back restores your row.",
+            ),
+            Line::from(
+                "Tab/BackTab cycle the sftp/forwarding/monitor surfaces; t returns to the terminal.",
+            ),
+            Line::from(
+                "Transcript viewer (escape layer l or monitor l): full-screen scrollback with f to toggle follow.",
+            ),
             Line::from("Forwarding pane: l/r/d stage local/remote/dynamic rules, x stops a rule."),
             Line::from("Session monitor: r requests a metrics refresh."),
+            Line::from(
+                "q asks for confirmation while a session, transfer, forward, or agent share is active.",
+            ),
             Line::from(""),
             Line::from("Press any key to return."),
         ];
@@ -3547,7 +4196,7 @@ impl SshTuiApp {
         });
 
         let mode = match self.mode {
-            Mode::Terminal | Mode::AgentOperationReview | Mode::Help => json!({
+            Mode::Terminal | Mode::AgentOperationReview => json!({
                 "kind": "terminal",
                 "raw_input": true,
                 "escape_armed": self.escape_armed,
@@ -3968,7 +4617,6 @@ fn mode_label(mode: Mode) -> &'static str {
         Mode::Monitor => "monitor",
         Mode::HostKeyPrompt => "host-key",
         Mode::AgentOperationReview => "agent-operation-review",
-        Mode::Help => "help",
         Mode::Disconnected => "disconnected",
         Mode::Error => "error",
     }
@@ -4040,15 +4688,21 @@ fn window_start(selected: usize, visible: usize, len: usize) -> usize {
     }
 }
 
+/// Vertical chrome of the TUI: header and status each carry two content rows
+/// (title + surface tabs, status + key hints) on top of their borders. The
+/// PTY grid must be derived from the same layout `draw` uses.
+fn tui_layout_constraints() -> [Constraint; 3] {
+    [
+        Constraint::Length(4),
+        Constraint::Min(8),
+        Constraint::Length(4),
+    ]
+}
+
 fn terminal_grid_size_for_area(area: Rect) -> TerminalGridSize {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Min(8),
-            Constraint::Length(3),
-            Constraint::Length(1),
-        ])
+        .constraints(tui_layout_constraints())
         .split(area);
     let terminal_area = chunks.get(1).copied().unwrap_or(area);
     TerminalGridSize::new(
@@ -5066,8 +5720,9 @@ mod tests {
         assert!(app.status.contains("recovery:"));
 
         app.handle_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE));
-        assert_eq!(app.mode, Mode::Help);
+        assert_eq!(app.overlay, Overlay::Help);
         app.handle_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE));
+        assert_eq!(app.overlay, Overlay::None);
         assert_eq!(app.mode, Mode::Disconnected);
     }
 
@@ -5139,7 +5794,8 @@ mod tests {
         let size = terminal_grid_size_for_area(Rect::new(0, 0, 120, 40));
 
         assert_eq!(size.cols, 118);
-        assert_eq!(size.rows, 31);
+        // Two-row header and status blocks (Length(4) each) shrink the pane.
+        assert_eq!(size.rows, 30);
     }
 
     #[test]
@@ -5235,6 +5891,341 @@ mod tests {
         let summary = safe_error_summary(&message);
         assert!(!summary.contains('\n'));
         assert!(summary.len() <= 180);
+    }
+
+    fn press(app: &mut SshTuiApp, code: KeyCode) {
+        app.handle_key(KeyEvent::new(code, KeyModifiers::NONE));
+    }
+
+    fn type_text(app: &mut SshTuiApp, text: &str) {
+        for ch in text.chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+    }
+
+    fn escape_then(app: &mut SshTuiApp, code: KeyCode) {
+        app.handle_key(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::CONTROL));
+        app.handle_key(KeyEvent::new(code, KeyModifiers::NONE));
+    }
+
+    fn fixture_app_in_mode(mode: Mode) -> SshTuiApp {
+        let mut app = SshTuiApp::new(fixture_launch()).unwrap();
+        app.host_key_prompt = None;
+        app.mode = mode;
+        app.return_mode = mode;
+        app
+    }
+
+    #[test]
+    fn quit_without_active_work_exits_but_active_work_asks_confirmation() {
+        let mut app = fixture_app_in_mode(Mode::Terminal);
+        escape_then(&mut app, KeyCode::Char('q'));
+        assert!(
+            app.should_quit,
+            "fixture quit with nothing active is immediate"
+        );
+
+        let mut app = fixture_app_in_mode(Mode::Terminal);
+        let store = temp_assist_store();
+        app.assist_store = store;
+        share_fixture_session(&mut app);
+
+        escape_then(&mut app, KeyCode::Char('q'));
+        assert_eq!(app.overlay, Overlay::ConfirmQuit);
+        assert!(!app.should_quit);
+        assert!(app.status.contains("agent session share active"));
+
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.overlay, Overlay::None);
+        assert!(!app.should_quit);
+
+        escape_then(&mut app, KeyCode::Char('q'));
+        press(&mut app, KeyCode::Char('y'));
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn staged_transfer_plan_asks_quit_confirmation() {
+        let mut app = fixture_app_in_mode(Mode::Sftp);
+        // Sorted entries: releases (dir), config.toml, startup.log.
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Char('d'));
+        assert!(app.transfer_plan.is_some(), "download plan staged");
+
+        escape_then(&mut app, KeyCode::Char('q'));
+        assert_eq!(app.overlay, Overlay::ConfirmQuit);
+        assert!(!app.should_quit);
+        assert!(app.status.contains("staged download plan"));
+
+        press(&mut app, KeyCode::Char('y'));
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn raw_terminal_input_is_untouched_by_overlay_routing() {
+        let mut app = fixture_app_in_mode(Mode::Terminal);
+
+        press(&mut app, KeyCode::Char('a'));
+        assert_eq!(app.forwarded_pty_writes, vec![b"a".to_vec()]);
+
+        escape_then(&mut app, KeyCode::Char('?'));
+        assert_eq!(app.overlay, Overlay::Help);
+        press(&mut app, KeyCode::Char('z'));
+        assert_eq!(app.overlay, Overlay::None);
+        assert_eq!(
+            app.forwarded_pty_writes.len(),
+            1,
+            "overlay consumes its key instead of the PTY"
+        );
+
+        press(&mut app, KeyCode::Char('b'));
+        assert_eq!(app.forwarded_pty_writes.len(), 2);
+        assert_eq!(app.forwarded_pty_writes[1], b"b".to_vec());
+    }
+
+    #[test]
+    fn transcript_viewer_scrolls_toggles_follow_and_never_writes_the_pty() {
+        let mut app = fixture_app_in_mode(Mode::Terminal);
+        app.push_line("alpha output");
+        app.push_line("beta output");
+
+        escape_then(&mut app, KeyCode::Char('l'));
+        assert_eq!(app.overlay, Overlay::TranscriptViewer);
+        assert!(app.transcript_follow);
+
+        press(&mut app, KeyCode::Up);
+        assert!(!app.transcript_follow);
+        assert_eq!(app.transcript_scroll, 1);
+
+        press(&mut app, KeyCode::PageUp);
+        assert_eq!(app.transcript_scroll, 11);
+
+        press(&mut app, KeyCode::End);
+        assert!(app.transcript_follow);
+        assert_eq!(app.transcript_scroll, 0);
+
+        press(&mut app, KeyCode::Char('f'));
+        assert!(!app.transcript_follow);
+        press(&mut app, KeyCode::Char('f'));
+        assert!(app.transcript_follow);
+
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.overlay, Overlay::None);
+        assert!(
+            app.forwarded_pty_writes.is_empty(),
+            "viewer keys never reach the remote shell"
+        );
+    }
+
+    #[test]
+    fn transcript_viewer_follows_new_output_until_scrolled() {
+        let mut app = fixture_app_in_mode(Mode::Terminal);
+        escape_then(&mut app, KeyCode::Char('l'));
+        assert!(app.transcript_follow);
+
+        app.push_terminal_output(b"fresh output\r\n");
+        assert!(app.transcript_follow);
+
+        press(&mut app, KeyCode::Up);
+        assert!(!app.transcript_follow);
+        assert_eq!(app.transcript_scroll, 1);
+
+        app.push_terminal_output(b"more output\r\n");
+        assert!(!app.transcript_follow);
+        assert_eq!(app.transcript_scroll, 1);
+
+        press(&mut app, KeyCode::Char('G'));
+        assert!(app.transcript_follow);
+        assert_eq!(app.transcript_scroll, 0);
+    }
+
+    #[test]
+    fn sftp_picker_filters_and_selects_entries() {
+        let mut app = fixture_app_in_mode(Mode::Sftp);
+
+        press(&mut app, KeyCode::Char('p'));
+        assert_eq!(app.overlay, Overlay::SftpPicker);
+        type_text(&mut app, "conf");
+        press(&mut app, KeyCode::Enter);
+
+        assert_eq!(app.overlay, Overlay::None);
+        assert_eq!(
+            app.selected_sftp_entry().map(|entry| entry.name),
+            Some("config.toml".to_string())
+        );
+        assert!(app.status.contains("picker selected"));
+    }
+
+    #[test]
+    fn sftp_filter_narrows_live_and_clears() {
+        let mut app = fixture_app_in_mode(Mode::Sftp);
+        assert_eq!(app.filtered_sftp_entries().len(), 3);
+
+        press(&mut app, KeyCode::Char('/'));
+        assert!(app.sftp_filter_input);
+        type_text(&mut app, "log");
+        assert_eq!(app.filtered_sftp_entries().len(), 1);
+
+        press(&mut app, KeyCode::Enter);
+        assert!(!app.sftp_filter_input);
+        assert_eq!(app.sftp_filter, "log");
+        assert!(app.status.contains("(1 matches)"));
+
+        press(&mut app, KeyCode::Char('/'));
+        press(&mut app, KeyCode::Esc);
+        assert!(app.sftp_filter.is_empty());
+        assert!(!app.sftp_filter_input);
+        assert_eq!(app.filtered_sftp_entries().len(), 3);
+        assert_eq!(app.mode, Mode::Sftp, "clearing the filter stays in sftp");
+    }
+
+    #[test]
+    fn sftp_selection_memory_survives_directory_navigation() {
+        let mut app = fixture_app_in_mode(Mode::Sftp);
+        // Sorted entries: releases (dir), config.toml, startup.log.
+        assert_eq!(app.selected_sftp_entry().unwrap().name, "releases");
+
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.sftp_path, "/srv/app/releases");
+        assert_eq!(
+            app.sftp_selection_memory.get("/srv/app"),
+            Some(&0),
+            "parent row remembered before diving in"
+        );
+
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Down);
+        assert_eq!(app.sftp_selected, 2);
+
+        press(&mut app, KeyCode::Backspace);
+        assert_eq!(app.sftp_path, "/srv/app");
+        assert_eq!(
+            app.sftp_selected, 0,
+            "returning to the parent restores its remembered row"
+        );
+
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.sftp_path, "/srv/app/releases");
+        assert_eq!(
+            app.sftp_selected, 2,
+            "re-entering the directory restores the row held there"
+        );
+    }
+
+    #[test]
+    fn page_keys_move_sftp_and_forward_selections() {
+        let mut app = fixture_app_in_mode(Mode::Sftp);
+        press(&mut app, KeyCode::PageDown);
+        assert_eq!(app.sftp_selected, 2);
+        press(&mut app, KeyCode::PageUp);
+        assert_eq!(app.sftp_selected, 0);
+
+        app.mode = Mode::Forwarding;
+        press(&mut app, KeyCode::PageDown);
+        assert_eq!(app.forward_selected, 1);
+        press(&mut app, KeyCode::PageUp);
+        assert_eq!(app.forward_selected, 0);
+    }
+
+    #[test]
+    fn background_sftp_error_becomes_banner_not_modal() {
+        let mut app = fixture_app_in_mode(Mode::Sftp);
+
+        app.handle_sftp_event(SftpEvent::Error(
+            "listing failed: permission denied".to_string(),
+        ));
+        assert!(app.error_banner.is_some());
+        assert_eq!(app.mode, Mode::Sftp, "errors must not hijack the surface");
+
+        press(&mut app, KeyCode::Char('j'));
+        assert!(
+            app.error_banner.is_none(),
+            "any key acknowledges the banner"
+        );
+        assert_eq!(
+            app.sftp_selected, 1,
+            "the acknowledging key keeps its meaning"
+        );
+    }
+
+    #[test]
+    fn tab_cycles_browsing_surfaces_but_tab_in_terminal_is_raw_input() {
+        let mut app = fixture_app_in_mode(Mode::Sftp);
+
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(app.mode, Mode::Forwarding);
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(app.mode, Mode::Monitor);
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(app.mode, Mode::Sftp);
+        press(&mut app, KeyCode::BackTab);
+        assert_eq!(app.mode, Mode::Monitor);
+
+        app.mode = Mode::Terminal;
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(app.mode, Mode::Terminal, "terminal Tab is never a hotkey");
+        assert_eq!(app.forwarded_pty_writes, vec![b"\t".to_vec()]);
+    }
+
+    #[test]
+    fn paste_is_blocked_while_an_overlay_is_open() {
+        let mut app = fixture_app_in_mode(Mode::Terminal);
+
+        escape_then(&mut app, KeyCode::Char('?'));
+        assert_eq!(app.overlay, Overlay::Help);
+        app.handle_paste("rm -rf /tmp/never\n");
+        assert!(app.forwarded_pty_writes.is_empty());
+
+        press(&mut app, KeyCode::Char('z'));
+        app.handle_paste("echo safe\n");
+        assert_eq!(app.forwarded_pty_writes, vec![b"echo safe\n".to_vec()]);
+    }
+
+    #[test]
+    fn sftp_listing_pending_marker_clears_on_events() {
+        let mut app = fixture_app_in_mode(Mode::Sftp);
+        let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
+        app.sftp_handle = Some(SftpHandle {
+            cmd_tx,
+            event_rx,
+            cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        });
+
+        app.request_sftp_list();
+        assert!(
+            app.sftp_pending,
+            "a live listing request marks the surface pending"
+        );
+        assert!(matches!(
+            cmd_rx.try_recv().ok(),
+            Some(SftpCommand::ListDir(path)) if path == "/srv/app"
+        ));
+
+        event_tx
+            .send(SftpEvent::DirListed {
+                path: "/srv/app".to_string(),
+                entries: vec![RemoteEntry {
+                    name: "config.toml".to_string(),
+                    is_dir: false,
+                    size: 1,
+                    permissions: Some(0o644),
+                    mtime: Some(0),
+                }],
+            })
+            .unwrap();
+        app.drain_service();
+        assert!(!app.sftp_pending);
+        assert!(app.status.contains("listed 1 entries"));
+
+        app.request_sftp_list();
+        assert!(app.sftp_pending);
+        event_tx
+            .send(SftpEvent::Error("listing failed".to_string()))
+            .unwrap();
+        app.drain_service();
+        assert!(!app.sftp_pending);
+        assert!(app.error_banner.is_some());
     }
 
     fn fixture_launch() -> SshTuiLaunch {
