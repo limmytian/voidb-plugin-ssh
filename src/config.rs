@@ -153,7 +153,9 @@ mod tests {
         assert_eq!(config.host, "example.com");
         assert_eq!(config.port, 22);
         assert_eq!(config.username, "root");
-        assert!(matches!(config.auth, SshAuthMethod::Password { ref password } if password == "secret"));
+        assert!(
+            matches!(config.auth, SshAuthMethod::Password { ref password } if password == "secret")
+        );
     }
 
     #[test]
@@ -166,8 +168,10 @@ mod tests {
         }"#;
         let config: SshConfig = serde_json::from_str(json).unwrap();
         assert_eq!(config.port, 2222);
-        assert!(matches!(config.auth, SshAuthMethod::PublicKey { ref private_key_path, ref passphrase }
-            if private_key_path == "/home/deploy/.ssh/id_ed25519" && passphrase.is_none()));
+        assert!(
+            matches!(config.auth, SshAuthMethod::PublicKey { ref private_key_path, ref passphrase }
+            if private_key_path == "/home/deploy/.ssh/id_ed25519" && passphrase.is_none())
+        );
     }
 
     #[test]
@@ -222,7 +226,9 @@ mod tests {
     fn new_creates_password_config() {
         let config = SshConfig::new("host".into(), 22, "user".into(), "pass".into());
         assert_eq!(config.host, "host");
-        assert!(matches!(config.auth, SshAuthMethod::Password { ref password } if password == "pass"));
+        assert!(
+            matches!(config.auth, SshAuthMethod::Password { ref password } if password == "pass")
+        );
     }
 
     #[test]

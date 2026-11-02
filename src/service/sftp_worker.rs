@@ -5,8 +5,8 @@
 //! Internal to the service module -- only the service background task
 //! creates SftpWorker instances.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use russh_sftp::client::SftpSession;
@@ -113,9 +113,7 @@ impl SftpWorker {
                     })
                     .collect();
 
-                entries.sort_by(|a, b| {
-                    b.is_dir.cmp(&a.is_dir).then_with(|| a.name.cmp(&b.name))
-                });
+                entries.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then_with(|| a.name.cmp(&b.name)));
 
                 let _ = event_tx.send(SftpEvent::DirListed {
                     path: canonical,
@@ -124,10 +122,7 @@ impl SftpWorker {
             }
             Ok(Err(e)) => {
                 error!("SFTP readdir failed: {}", e);
-                let _ = event_tx.send(SftpEvent::Error(format!(
-                    "Failed to list directory: {}",
-                    e
-                )));
+                let _ = event_tx.send(SftpEvent::Error(format!("Failed to list directory: {}", e)));
             }
         }
     }
@@ -152,13 +147,16 @@ impl SftpWorker {
             Ok(Ok(f)) => f,
             Ok(Err(e)) => {
                 error!("SFTP open failed: {}", e);
-                let _ =
-                    event_tx.send(SftpEvent::Error(format!("Failed to open remote file: {}", e)));
+                let _ = event_tx.send(SftpEvent::Error(format!(
+                    "Failed to open remote file: {}",
+                    e
+                )));
                 return;
             }
             Err(_) => {
-                let _ =
-                    event_tx.send(SftpEvent::Error("Timed out opening remote file".to_string()));
+                let _ = event_tx.send(SftpEvent::Error(
+                    "Timed out opening remote file".to_string(),
+                ));
                 return;
             }
         };
@@ -208,10 +206,8 @@ impl SftpWorker {
                 Err(e) => {
                     let _ = tokio::fs::remove_file(local).await;
                     error!("SFTP read failed: {}", e);
-                    let _ = event_tx.send(SftpEvent::Error(format!(
-                        "Failed to download file: {}",
-                        e
-                    )));
+                    let _ =
+                        event_tx.send(SftpEvent::Error(format!("Failed to download file: {}", e)));
                     return;
                 }
             }
@@ -341,10 +337,7 @@ impl SftpWorker {
         match sftp.remove_file(path).await {
             Ok(()) => {
                 let name = path.rsplit('/').next().unwrap_or(path);
-                let _ = event_tx.send(SftpEvent::OperationComplete(format!(
-                    "Deleted '{}'",
-                    name
-                )));
+                let _ = event_tx.send(SftpEvent::OperationComplete(format!("Deleted '{}'", name)));
                 // Auto-refresh parent directory
                 let parent = parent_path(path);
                 Self::handle_list_dir(sftp, &parent, event_tx).await;
@@ -371,10 +364,7 @@ impl SftpWorker {
                 Self::handle_list_dir(sftp, &parent, event_tx).await;
             }
             Err(e) => {
-                let _ = event_tx.send(SftpEvent::Error(format!(
-                    "Remove directory failed: {}",
-                    e
-                )));
+                let _ = event_tx.send(SftpEvent::Error(format!("Remove directory failed: {}", e)));
             }
         }
     }
@@ -440,10 +430,7 @@ impl SftpWorker {
                 Self::handle_list_dir(sftp, &parent, event_tx).await;
             }
             Err(e) => {
-                let _ = event_tx.send(SftpEvent::Error(format!(
-                    "Create directory failed: {}",
-                    e
-                )));
+                let _ = event_tx.send(SftpEvent::Error(format!("Create directory failed: {}", e)));
             }
         }
     }

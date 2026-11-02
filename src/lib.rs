@@ -140,7 +140,9 @@ pub async fn test_connection(
             }
             #[cfg(not(unix))]
             {
-                return Err(anyhow!("SSH agent authentication is not supported on Windows yet"));
+                return Err(anyhow!(
+                    "SSH agent authentication is not supported on Windows yet"
+                ));
             }
         }
     }

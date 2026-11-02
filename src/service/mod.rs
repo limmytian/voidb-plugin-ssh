@@ -1221,7 +1221,10 @@ async fn connect_and_auth_direct(
                 let mut agent = russh_keys::agent::client::AgentClient::connect_env()
                     .await
                     .map_err(|e| {
-                        voidb_core::VoidbError::Connection(format!("SSH agent not available: {}", e))
+                        voidb_core::VoidbError::Connection(format!(
+                            "SSH agent not available: {}",
+                            e
+                        ))
                     })?;
                 let identities = agent.request_identities().await.map_err(|e| {
                     voidb_core::VoidbError::Connection(format!("Agent list failed: {}", e))

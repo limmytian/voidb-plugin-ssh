@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use russh::client;
 use russh::client::Msg;
@@ -366,7 +366,9 @@ impl SshSession {
                     .authenticate_password(&config.username, password)
                     .await?;
                 if !authenticated {
-                    return Err(anyhow!("Authentication failed: invalid username or password"));
+                    return Err(anyhow!(
+                        "Authentication failed: invalid username or password"
+                    ));
                 }
             }
             SshAuthMethod::PublicKey {
@@ -427,7 +429,9 @@ impl SshSession {
                 }
                 #[cfg(not(unix))]
                 {
-                    return Err(anyhow!("SSH agent authentication is not supported on Windows yet"));
+                    return Err(anyhow!(
+                        "SSH agent authentication is not supported on Windows yet"
+                    ));
                 }
             }
         }

@@ -4,8 +4,8 @@
 //! via an unbounded mpsc channel. PTY data flows through a separate
 //! dedicated byte channel (not as events) per the hybrid I/O design.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use tokio::sync::{mpsc, oneshot};
 
@@ -59,10 +59,7 @@ pub enum SshEvent {
     SftpError(String),
 
     /// A forwarding rule's status changed.
-    ForwardStatusChanged {
-        id: u32,
-        status: ForwardStatus,
-    },
+    ForwardStatusChanged { id: u32, status: ForwardStatus },
 
     /// New system metrics snapshot available.
     MetricsUpdate(SystemMetrics),

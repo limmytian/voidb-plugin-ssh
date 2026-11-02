@@ -4,8 +4,8 @@
 //! via an unbounded mpsc channel. Uses grouped sub-enums for SFTP,
 //! forwarding, and metrics domains.
 
-use crate::config::SshConfig;
 use super::types::ForwardType;
+use crate::config::SshConfig;
 
 /// Top-level command enum for the SSH service.
 ///

@@ -4,8 +4,8 @@
 //! load average metrics from the remote host. Supports both Linux and macOS.
 //! Internal to the service module.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use tokio::sync::{mpsc, oneshot};
@@ -357,9 +357,11 @@ fn parse_macos_vmstat(vmstat: &str, memsize: &str) -> Result<(MemoryInfo, u64), 
         .next()
         .and_then(|l| {
             // "Mach Virtual Memory Statistics: (page size of 16384 bytes)"
-            l.rsplit("page size of ")
-                .next()
-                .and_then(|s| s.trim_end_matches(|c: char| !c.is_ascii_digit()).parse().ok())
+            l.rsplit("page size of ").next().and_then(|s| {
+                s.trim_end_matches(|c: char| !c.is_ascii_digit())
+                    .parse()
+                    .ok()
+            })
         })
         .unwrap_or(4096);
 
@@ -395,8 +397,7 @@ fn parse_macos_vmstat(vmstat: &str, memsize: &str) -> Result<(MemoryInfo, u64), 
         .unwrap_or(0);
 
     let used = (active_pages + wired_pages) * page_size;
-    let available =
-        (free_pages + inactive_pages + speculative_pages + purgeable_pages) * page_size;
+    let available = (free_pages + inactive_pages + speculative_pages + purgeable_pages) * page_size;
 
     Ok((
         MemoryInfo {
@@ -412,10 +413,7 @@ fn parse_macos_vmstat(vmstat: &str, memsize: &str) -> Result<(MemoryInfo, u64), 
 
 fn parse_macos_loadavg(text: &str) -> Result<[f64; 3], String> {
     // "{ 0.52 1.03 0.87 }" or just "0.52 1.03 0.87"
-    let cleaned = text
-        .trim_start_matches('{')
-        .trim_end_matches('}')
-        .trim();
+    let cleaned = text.trim_start_matches('{').trim_end_matches('}').trim();
     let parts: Vec<&str> = cleaned.split_whitespace().collect();
     if parts.len() < 3 {
         return Err("Failed to parse macOS load average".to_string());

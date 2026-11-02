@@ -3,8 +3,8 @@
 //! Consolidates types from SFTP, port forwarding, and system metrics
 //! into a single module for the service layer's public API.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 
 // === SFTP types (from sftp/types.rs) ===
@@ -24,31 +24,19 @@ pub enum SftpCommand {
     /// List directory contents at the given path
     ListDir(String),
     /// Download a remote file to a local path
-    DownloadFile {
-        remote: String,
-        local: String,
-    },
+    DownloadFile { remote: String, local: String },
     /// Upload a local file to a remote directory
-    UploadFile {
-        local: String,
-        remote_dir: String,
-    },
+    UploadFile { local: String, remote_dir: String },
     /// Delete a remote file
     DeleteFile(String),
     /// Delete a remote directory
     DeleteDir(String),
     /// Rename a remote file or directory
-    Rename {
-        old: String,
-        new: String,
-    },
+    Rename { old: String, new: String },
     /// Create a remote directory
     CreateDir(String),
     /// Change permissions of a remote file or directory
-    Chmod {
-        path: String,
-        mode: u32,
-    },
+    Chmod { path: String, mode: u32 },
     /// Cancel all active transfers
     CancelTransfer,
 }
@@ -157,10 +145,7 @@ pub enum ForwardType {
         local_port: u16,
     },
     /// Dynamic SOCKS5 proxy: listen locally as SOCKS5 proxy (-D)
-    Dynamic {
-        bind_addr: String,
-        bind_port: u16,
-    },
+    Dynamic { bind_addr: String, bind_port: u16 },
 }
 
 /// Status of a forwarding rule
@@ -225,13 +210,19 @@ impl ForwardType {
                 bind_port,
                 remote_host,
                 remote_port,
-            } => format!("-L {}:{}:{}:{}", bind_addr, bind_port, remote_host, remote_port),
+            } => format!(
+                "-L {}:{}:{}:{}",
+                bind_addr, bind_port, remote_host, remote_port
+            ),
             ForwardType::Remote {
                 remote_addr,
                 remote_port,
                 local_host,
                 local_port,
-            } => format!("-R {}:{}:{}:{}", remote_addr, remote_port, local_host, local_port),
+            } => format!(
+                "-R {}:{}:{}:{}",
+                remote_addr, remote_port, local_host, local_port
+            ),
             ForwardType::Dynamic {
                 bind_addr,
                 bind_port,

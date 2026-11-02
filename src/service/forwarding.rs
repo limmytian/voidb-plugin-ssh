@@ -4,8 +4,8 @@
 //! ForwardingManager and spawns it when an SSH session connects. External
 //! code interacts via `SshCommand::Forward(...)`.
 
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use russh::client::Msg;
 use russh::{Channel, ChannelMsg};
@@ -427,7 +427,9 @@ impl ForwardingManager {
         if let Some(rule) = self.rules.iter_mut().find(|r| r.id == id) {
             rule.status = status.clone();
         }
-        let _ = self.event_tx.send(ForwardEvent::StatusChanged { id, status });
+        let _ = self
+            .event_tx
+            .send(ForwardEvent::StatusChanged { id, status });
     }
 }
 
