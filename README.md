@@ -17,13 +17,13 @@ Independent process plugin for [VoidB](https://github.com/limmytian/voidb) for S
 
 ```bash
 # Connectivity test
-voidb-cli ssh test --profile prod-server
+vb ssh test --profile prod-server
 
 # Launch standalone interactive fullscreen SSH terminal
-voidb-cli ssh tui --profile prod-server
+vb ssh tui --profile prod-server
 
 # Machine / Agent stdio-jsonrpc server
-voidb-cli ssh serve
+vb ssh serve
 ```
 
 ## Optional local SDK development
